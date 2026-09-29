@@ -1,0 +1,5 @@
+{
+  "title": "Quarterly Metrics Report",
+  "generatedBy": "event-loop-block-demo",
+  "columns": ["revenue", "latency", "errors", "saturation", "throughput", "cost"]
+}
