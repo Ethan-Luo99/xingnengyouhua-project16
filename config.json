@@ -1,0 +1,6 @@
+{
+  "title": "季度服务性能报告",
+  "generator": "report.ts/blocking-benchmark",
+  "columns": 8,
+  "cellHashRounds": 180000
+}
