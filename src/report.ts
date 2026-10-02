@@ -1,19 +1,28 @@
+/**
+ * 事件循环阻塞反例的"零阻塞"重构版。
+ *
+ * 双路径并存:
+ *  - legacy 阻塞路径(generatePageLegacy / renderMetric / loadConfigSync):
+ *    原样保留的反例实现 —— 每次调用同步 readFileSync(config.json),
+ *    全部单元格的 CPU 计算在主线程一次性串行跑完。
+ *  - 零阻塞路径(generatePage 异步版):
+ *    1. config.json 启动期一次性异步读取并缓存(initConfig),请求路径零同步 I/O;
+ *    2. 单元格 CPU 计算默认交给 worker_threads 线程池(MetricWorkerPool),
+ *       线程池不可用或 worker 崩溃时自动降级为 setImmediate 分片计算,
+ *       两种模式下主线程都不会被长时间独占。
+ *
+ * 两条路径共用同一个 assembleHtml 模板函数与同一个 computeMetric 纯函数,
+ * 输出逐字节等价,与分片/调度顺序无关。
+ */
 import { readFileSync } from "node:fs";
+import { readFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { performance, monitorEventLoopDelay } from "node:perf_hooks";
-import { fileURLToPath } from "node:url";
+import { setImmediate as yieldToEventLoop } from "node:timers/promises";
 import path from "node:path";
-
-/**
- * 刻意构造的事件循环阻塞反例。
- *
- * 阻塞来源有两处，二者都运行在事件循环线程上：
- *  1. 同步 I/O —— generatePage 每次调用都执行 readFileSync("./config.json")。
- *     libuv 在同步系统调用期间无法处理定时器 / I/O 回调 / 微任务之外的任何事件。
- *  2. CPU 密集串行计算 —— 每个 <td> 都真实调用 renderMetric(i)，其内部是
- *     纯整数的哈希混合 + 试除质数判定，rowCount * columns 个单元格串行执行，
- *     长时间占用调用栈，事件循环在整段计算结束前没有任何机会取得控制权。
- */
+import { fileURLToPath } from "node:url";
+import { computeMetric } from "./metric-core.js";
+import { MetricWorkerPool } from "./worker-pool.js";
 
 const CONFIG_PATH = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
@@ -24,6 +33,10 @@ const CONFIG_PATH = path.resolve(
 const COLUMN_COUNT_FALLBACK = 8;
 const HASH_ROUNDS_FALLBACK = 2000;
 
+/** rowCount=64 时必须复现的基准摘要(与阻塞版本逐字节一致)。 */
+export const EXPECTED_SHA256_ROW64 =
+  "a6aeae862721779f9d4d043de1a3a37aae0b60057a7541e75d7d18fa27ceb7dc";
+
 interface ReportConfig {
   title: string;
   generator: string;
@@ -31,7 +44,7 @@ interface ReportConfig {
   cellHashRounds: number;
 }
 
-/** renderMetric 被调用的真实次数，用于在基准中校验 ">=300 次函数执行"。 */
+/** renderMetric / 分片计算被调用的真实次数,用于校验 ">=300 次函数执行"。 */
 let renderMetricInvocations = 0;
 
 export function getRenderMetricInvocations(): number {
@@ -42,75 +55,7 @@ export function resetRenderMetricInvocations(): void {
   renderMetricInvocations = 0;
 }
 
-/**
- * 32 位整数 xorshift-multiply 混合（确定性、无随机源、无浮点误差），
- * 是真实的逐轮 CPU 运算，不是空转也不是常量返回。
- */
-function mixHash32(state: number, round: number): number {
-  let h = (state ^ round) | 0;
-  h ^= h << 13;
-  h = (h | 0) >>> 0;
-  h ^= h >>> 17;
-  h = (h | 0) >>> 0;
-  h ^= h << 5;
-  h = Math.imul(h, 0x9e3779b9) >>> 0;
-  return h;
-}
-
-function isPrime(candidate: number): boolean {
-  if (candidate < 2) {
-    return false;
-  }
-  if (candidate % 2 === 0) {
-    return candidate === 2;
-  }
-  const limit = Math.floor(Math.sqrt(candidate));
-  for (let divisor = 3; divisor <= limit; divisor += 2) {
-    if (candidate % divisor === 0) {
-      return false;
-    }
-  }
-  return true;
-}
-
-/**
- * 每个单元格调用一次的真实 CPU 计算函数。
- * 依据单元格序号 i 做确定性运算，输出一个两位小数的指标字符串。
- */
-export function renderMetric(i: number): string {
-  renderMetricInvocations += 1;
-
-  const rounds = loadConfigSync().cellHashRounds;
-  let h = (0x811c9dc5 ^ (i + 1)) >>> 0;
-
-  for (let round = 0; round < rounds; round += 1) {
-    h = mixHash32(h, round);
-  }
-
-  // 在哈希结果附近试除寻找一个质数，进一步增加真实的整数运算量。
-  const primeCandidateBase = (h % 4096) * 2 + 1001;
-  let candidate = primeCandidateBase;
-  while (!isPrime(candidate)) {
-    candidate += 2;
-  }
-
-  const metric = (h % 100000) / 100 + (candidate % 97) / 100;
-  return metric.toFixed(2);
-}
-
-function escapeHtml(text: string): string {
-  return text
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;");
-}
-
-/** 同步读取并解析 ./config.json —— 阻塞点之一。 */
-export function loadConfigSync(): ReportConfig {
-  const raw = readFileSync(CONFIG_PATH, "utf8");
-  const parsed: unknown = JSON.parse(raw);
-
+function parseConfig(parsed: unknown): ReportConfig {
   if (
     typeof parsed !== "object" ||
     parsed === null ||
@@ -141,18 +86,72 @@ export function loadConfigSync(): ReportConfig {
   };
 }
 
-/**
- * 生成 <table> 结构的 HTML 报告。
- * 每个单元格真实调用 renderMetric(i)（i 全局递增），
- * 输出完全由 (rowCount, config.json) 决定，因此可复现。
- */
-export function generatePage(rowCount: number): string {
-  if (!Number.isInteger(rowCount) || rowCount < 0) {
-    throw new Error("rowCount 必须是非负整数");
-  }
+/** 同步读取并解析 ./config.json —— legacy 阻塞路径专用,原样保留。 */
+export function loadConfigSync(): ReportConfig {
+  const raw = readFileSync(CONFIG_PATH, "utf8");
+  return parseConfig(JSON.parse(raw));
+}
 
-  const rawConfig = readFileSync(CONFIG_PATH, "utf8");
-  const config = loadConfigSync();
+export interface LoadedConfig {
+  /** 配置文件原始文本,逐字节参与 HTML 注释拼接。 */
+  rawConfig: string;
+  config: ReportConfig;
+}
+
+let configCache: LoadedConfig | null = null;
+let configLoadPromise: Promise<LoadedConfig> | null = null;
+
+/**
+ * 启动期一次性异步读取并缓存 config.json。
+ * 之后请求路径上只读内存缓存,不再出现任何同步 I/O。
+ */
+export function initConfig(): Promise<LoadedConfig> {
+  configLoadPromise ??= readFile(CONFIG_PATH, "utf8").then((rawConfig) => {
+    const loaded: LoadedConfig = {
+      rawConfig,
+      config: parseConfig(JSON.parse(rawConfig)),
+    };
+    configCache = loaded;
+    return loaded;
+  });
+  return configLoadPromise;
+}
+
+function getCachedConfig(): LoadedConfig {
+  if (configCache === null) {
+    throw new Error("config 尚未初始化,请先在启动期 await initConfig()");
+  }
+  return configCache;
+}
+
+/**
+ * legacy 阻塞路径的单元格计算:每单元格都同步 readFileSync(config.json)
+ * 再跑 CPU 密集运算 —— 反例原样保留,仅供对照基准使用。
+ */
+export function renderMetric(i: number): string {
+  renderMetricInvocations += 1;
+  const rounds = loadConfigSync().cellHashRounds;
+  return computeMetric(i, rounds);
+}
+
+function escapeHtml(text: string): string {
+  return text
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;");
+}
+
+/**
+ * 唯一的 HTML 模板拼装函数,legacy 与零阻塞路径共用,
+ * 从结构上保证两条路径输出逐字节等价。
+ */
+function assembleHtml(
+  rawConfig: string,
+  config: ReportConfig,
+  rowCount: number,
+  metrics: string[],
+): string {
   const columns = config.columns;
 
   const lines: string[] = [];
@@ -185,7 +184,9 @@ export function generatePage(rowCount: number): string {
     const cells: string[] = [];
     for (let column = 0; column < columns; column += 1) {
       const metricIndex = row * columns + column;
-      cells.push(`<td data-i="${metricIndex}">${renderMetric(metricIndex)}</td>`);
+      cells.push(
+        `<td data-i="${metricIndex}">${metrics[metricIndex] ?? ""}</td>`,
+      );
     }
     lines.push(`<tr>${cells.join("")}</tr>`);
   }
@@ -199,23 +200,167 @@ export function generatePage(rowCount: number): string {
   return `${lines.join("\n")}\n`;
 }
 
+function assertValidRowCount(rowCount: number): void {
+  if (!Number.isInteger(rowCount) || rowCount < 0) {
+    throw new Error("rowCount 必须是非负整数");
+  }
+}
+
+/**
+ * legacy 阻塞路径:同步 I/O + 主线程串行 CPU,反例原样保留。
+ * 可用 benchmark({ path: "legacy" }) 单独切换测量。
+ */
+export function generatePageLegacy(rowCount: number): string {
+  assertValidRowCount(rowCount);
+
+  const rawConfig = readFileSync(CONFIG_PATH, "utf8");
+  const config = loadConfigSync();
+  const columns = config.columns;
+
+  const metrics: string[] = [];
+  for (let row = 0; row < rowCount; row += 1) {
+    for (let column = 0; column < columns; column += 1) {
+      metrics.push(renderMetric(row * columns + column));
+    }
+  }
+
+  return assembleHtml(rawConfig, config, rowCount, metrics);
+}
+
+/** 分片让出的时间片预算:每片最多占用主线程 4ms,保证卡顿远低于 5ms 目标。 */
+const CHUNK_TIME_BUDGET_MS = 4;
+
+/**
+ * 降级路径:setImmediate 分片计算。
+ * 每片在 CHUNK_TIME_BUDGET_MS 内跑完后让出事件循环,
+ * 定时器 / I/O 回调在片间都能被及时处理。
+ */
+async function computeMetricsChunked(
+  indices: number[],
+  rounds: number,
+): Promise<string[]> {
+  const results: string[] = new Array<string>(indices.length);
+  let sliceStart = performance.now();
+
+  for (let position = 0; position < indices.length; position += 1) {
+    const index = indices[position] as number;
+    results[position] = computeMetric(index, rounds);
+    renderMetricInvocations += 1;
+
+    if (performance.now() - sliceStart >= CHUNK_TIME_BUDGET_MS) {
+      await yieldToEventLoop();
+      sliceStart = performance.now();
+    }
+  }
+
+  return results;
+}
+
+export type ComputeMode = "worker-pool" | "chunked-fallback";
+
+let pool: MetricWorkerPool | null = null;
+let poolDisabled = process.env.REPORT_FORCE_FALLBACK === "1";
+let lastComputeMode: ComputeMode = poolDisabled
+  ? "chunked-fallback"
+  : "worker-pool";
+
+/** 最近一次零阻塞 generatePage 实际使用的计算模式。 */
+export function getLastComputeMode(): ComputeMode {
+  return lastComputeMode;
+}
+
+function getPool(): MetricWorkerPool | null {
+  if (poolDisabled) {
+    return null;
+  }
+  if (pool === null) {
+    try {
+      pool = new MetricWorkerPool();
+    } catch (error) {
+      poolDisabled = true;
+      console.warn(
+        "⚠ worker 线程池创建失败,降级为 setImmediate 分片计算:",
+        error instanceof Error ? error.message : String(error),
+      );
+      return null;
+    }
+  }
+  return pool;
+}
+
+/** 优雅关闭线程池:等待全部 worker 退出,进程可正常结束。 */
+export async function shutdownReportResources(): Promise<void> {
+  const current = pool;
+  pool = null;
+  if (current !== null) {
+    await current.shutdown();
+  }
+}
+
+/**
+ * 零阻塞路径:异步生成与 legacy 逐字节等价的 HTML 报告。
+ *  - config 来自启动期缓存,零同步 I/O;
+ *  - 单元格计算默认在 worker 线程池执行;池故障时打印告警并
+ *    降级为 setImmediate 分片计算,输出不变、进程不因此失败。
+ */
+export async function generatePage(rowCount: number): Promise<string> {
+  assertValidRowCount(rowCount);
+
+  const { rawConfig, config } = await initConfig();
+  const columns = config.columns;
+
+  const indices: number[] = [];
+  for (let cell = 0; cell < rowCount * columns; cell += 1) {
+    indices.push(cell);
+  }
+
+  let metrics: string[];
+  const activePool = getPool();
+  if (activePool !== null) {
+    try {
+      metrics = await activePool.compute(indices, config.cellHashRounds);
+      renderMetricInvocations += indices.length;
+      lastComputeMode = "worker-pool";
+    } catch (error) {
+      poolDisabled = true;
+      console.warn(
+        "⚠ worker 线程池故障,降级为 setImmediate 分片计算:",
+        error instanceof Error ? error.message : String(error),
+      );
+      await shutdownReportResources();
+      metrics = await computeMetricsChunked(indices, config.cellHashRounds);
+      lastComputeMode = "chunked-fallback";
+    }
+  } else {
+    metrics = await computeMetricsChunked(indices, config.cellHashRounds);
+    lastComputeMode = "chunked-fallback";
+  }
+
+  return assembleHtml(rawConfig, config, rowCount, metrics);
+}
+
 export interface LagSample {
-  /** 采样窗口内事件循环回调的最大延迟（毫秒）。 */
+  /** 采样窗口内事件循环回调的最大延迟(毫秒)。 */
   maxLagMs: number;
-  /** 采样窗口内回调延迟的平均值（毫秒）。 */
+  /** 采样窗口内回调延迟的平均值(毫秒)。 */
   meanLagMs: number;
   /** 期间错过 10ms 节拍的回调数量。 */
   delayedTicks: number;
 }
 
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
 /**
- * 用一个 10ms 的 setInterval 作为探针测量事件循环延迟。
- * 空闲时各 tick 间隔约 10ms；同步阻塞期间探针无法触发，
- * 阻塞结束后的首个 tick 会"还债"，其超出 10ms 的漂移即卡顿量。
+ * 用 10ms setInterval 探针 + monitorEventLoopDelay 直方图测量
+ * work 执行期间的事件循环延迟。work 可为同步(legacy)或异步(零阻塞)。
  */
-async function measureEventLoopLag(
-  blockedWork: () => void,
-  warmupMs: number,
+async function measureLagDuring(
+  work: () => void | Promise<unknown>,
+  settleMs: number,
 ): Promise<LagSample> {
   const tickIntervalMs = 10;
   let maxLagMs = 0;
@@ -223,40 +368,40 @@ async function measureEventLoopLag(
   let tickCount = 0;
   let delayedTicks = 0;
 
-  await new Promise<void>((resolve) => {
-    let previous = performance.now();
+  const histogram = monitorEventLoopDelay({ resolution: 1 });
+  histogram.enable();
 
-    const timer = setInterval(() => {
-      const now = performance.now();
-      const drift = now - previous - tickIntervalMs;
-      previous = now;
-      tickCount += 1;
+  let previous = performance.now();
+  const timer = setInterval(() => {
+    const now = performance.now();
+    const drift = now - previous - tickIntervalMs;
+    previous = now;
+    tickCount += 1;
 
-      if (drift > 1) {
-        maxLagMs = Math.max(maxLagMs, drift);
-        lagSumMs += drift;
-        if (drift > tickIntervalMs) {
-          delayedTicks += 1;
-        }
+    if (drift > 1) {
+      maxLagMs = Math.max(maxLagMs, drift);
+      lagSumMs += drift;
+      if (drift > tickIntervalMs) {
+        delayedTicks += 1;
       }
-    }, tickIntervalMs);
+    }
+  }, tickIntervalMs);
 
-    setTimeout(() => {
-      blockedWork();
-    }, warmupMs);
+  await work();
+  await delay(settleMs);
 
-    setTimeout(
-      () => {
-        clearInterval(timer);
-        resolve();
-      },
-      warmupMs + 2500,
-    );
-  });
+  clearInterval(timer);
+  histogram.disable();
 
+  const histogramMeanMs = histogram.mean / 1e6;
   return {
-    maxLagMs,
-    meanLagMs: tickCount > 0 ? lagSumMs / tickCount : 0,
+    maxLagMs: Math.max(maxLagMs, histogram.max / 1e6),
+    meanLagMs:
+      tickCount > 0
+        ? lagSumMs / tickCount
+        : Number.isFinite(histogramMeanMs)
+          ? histogramMeanMs
+          : 0,
     delayedTicks,
   };
 }
@@ -271,115 +416,197 @@ function median(values: number[]): number {
   return sorted[middle] ?? 0;
 }
 
+export type BenchPath = "legacy" | "zero" | "both";
+
+export interface PathBenchmark {
+  /** 单次生成耗时(毫秒),共 runs 次。 */
+  durationsMs: number[];
+  medianMs: number;
+  /** 单次 generatePage 期间实测事件循环卡顿。 */
+  lag: LagSample;
+  /** 相对空闲基线的卡顿放大量。 */
+  lagAmplification: number;
+  digests: string[];
+  renderMetricCallsPerRun: number;
+  /** 零阻塞路径实际计算模式。 */
+  computeMode: ComputeMode | "sync-blocking";
+  /** 零阻塞路径实测吞吐(页/秒)。 */
+  throughputPagesPerSec?: number;
+}
+
 export interface BenchmarkResult {
   rowCount: number;
   columnCount: number;
   cellCount: number;
-  renderMetricCallsPerRun: number;
-  renderMetricCallsEachRun: number[];
-  meets300Calls: boolean;
-  totalDurationsMs: number[];
-  totalMedianMs: number;
-  blockedLag: LagSample;
   baselineLag: LagSample;
+  legacy: PathBenchmark | null;
+  zero: PathBenchmark | null;
+  /** 同一路径多轮输出逐字节一致。 */
   identicalAcrossRuns: boolean;
-  digests: string[];
-  syncConfigReadMs: number;
+  /** 两条路径输出逐字节一致。 */
+  crossPathIdentical: boolean;
+  expectedDigest: string | null;
+  digestMatchesExpected: boolean;
   htmlLength: number;
+  meets300Calls: boolean;
+  /** 零阻塞路径单次生成期间最大卡顿 ≤ 5ms。 */
+  zeroPathMaxLagOk: boolean;
 }
 
 export interface BenchmarkOptions {
   rowCount?: number;
   runs?: number;
+  /** 测量哪条路径,默认 both 双路径对照。 */
+  path?: BenchPath;
+  /** 吞吐测量窗口(毫秒),仅零阻塞路径。 */
+  throughputWindowMs?: number;
 }
 
+const ZERO_PATH_MAX_LAG_BUDGET_MS = 5;
+
 /**
- * 量化卡顿并校验可复现性：
- *  - 总耗时：performance.now() 包裹同步 generatePage；
- *  - 事件延迟：setInterval 探针 + monitorEventLoopDelay 直方图（max/mean）；
- *  - 可复现：多次运行的 HTML 逐字节相等且 SHA-256 相同。
+ * 双路径对照基准:同一进程内分别测量 legacy 阻塞路径与零阻塞路径的
+ * 单次耗时、事件循环最大延迟、卡顿放大量;零阻塞路径额外测量吞吐。
+ * 同时校验可复现性(多轮一致、跨路径一致、与基准 SHA-256 一致)。
  */
 export async function benchmark(
   options: BenchmarkOptions = {},
 ): Promise<BenchmarkResult> {
   const rowCount = options.rowCount ?? 64;
   const runs = options.runs ?? 3;
-  const config = loadConfigSync();
+  const pathOption = options.path ?? "both";
+  const throughputWindowMs = options.throughputWindowMs ?? 1000;
 
-  const totalDurationsMs: number[] = [];
-  const digests: string[] = [];
-  const outputs: string[] = [];
-  const callsEachRun: number[] = [];
+  // 启动期一次性异步读取并缓存配置,之后请求路径零同步 I/O。
+  const { config } = await initConfig();
 
-  for (let run = 0; run < runs; run += 1) {
-    resetRenderMetricInvocations();
-    const start = performance.now();
-    const html = generatePage(rowCount);
-    const end = performance.now();
+  const baselineLag = await measureLagDuring(() => delay(300), 50);
 
-    totalDurationsMs.push(end - start);
-    digests.push(sha256Hex(html));
-    outputs.push(html);
-    callsEachRun.push(getRenderMetricInvocations());
+  const runLegacy = pathOption === "both" || pathOption === "legacy";
+  const runZero = pathOption === "both" || pathOption === "zero";
+
+  let legacy: PathBenchmark | null = null;
+  let legacyHtml = "";
+  if (runLegacy) {
+    const durationsMs: number[] = [];
+    const digests: string[] = [];
+    let callsPerRun = 0;
+
+    for (let run = 0; run < runs; run += 1) {
+      resetRenderMetricInvocations();
+      const start = performance.now();
+      const html = generatePageLegacy(rowCount);
+      durationsMs.push(performance.now() - start);
+      digests.push(sha256Hex(html));
+      callsPerRun = getRenderMetricInvocations();
+      if (run === 0) {
+        legacyHtml = html;
+      }
+    }
+
+    const lag = await measureLagDuring(() => {
+      generatePageLegacy(rowCount);
+    }, 300);
+
+    legacy = {
+      durationsMs,
+      medianMs: median(durationsMs),
+      lag,
+      lagAmplification: lag.maxLagMs / Math.max(baselineLag.maxLagMs, 0.01),
+      digests,
+      renderMetricCallsPerRun: callsPerRun,
+      computeMode: "sync-blocking",
+    };
   }
 
-  const renderMetricCallsPerRun = callsEachRun[0] ?? 0;
+  let zero: PathBenchmark | null = null;
+  let zeroHtml = "";
+  if (runZero) {
+    // 预热:建池 + JIT,不计入测量。
+    await generatePage(rowCount);
 
-  const firstDigest = digests[0] ?? "";
-  const identicalAcrossRuns = digests.every(
-    (digest) => digest === firstDigest,
-  ) && outputs.every((html) => html === (outputs[0] ?? ""));
+    const durationsMs: number[] = [];
+    const digests: string[] = [];
+    let callsPerRun = 0;
 
-  const readStart = performance.now();
-  readFileSync(CONFIG_PATH, "utf8");
-  const syncConfigReadMs = performance.now() - readStart;
+    for (let run = 0; run < runs; run += 1) {
+      resetRenderMetricInvocations();
+      const start = performance.now();
+      const html = await generatePage(rowCount);
+      durationsMs.push(performance.now() - start);
+      digests.push(sha256Hex(html));
+      callsPerRun = getRenderMetricInvocations();
+      if (run === 0) {
+        zeroHtml = html;
+      }
+    }
 
-  const baselineHistogram = monitorEventLoopDelay({ resolution: 1 });
-  baselineHistogram.enable();
-  const baselineLag = await measureEventLoopLag(() => {
-    // 空闲基线：不做任何阻塞工作。
-  }, 300);
-  baselineHistogram.disable();
+    const lag = await measureLagDuring(async () => {
+      await generatePage(rowCount);
+    }, 300);
 
-  const blockedHistogram = monitorEventLoopDelay({ resolution: 1 });
-  blockedHistogram.enable();
-  const blockedLag = await measureEventLoopLag(() => {
-    resetRenderMetricInvocations();
-    generatePage(rowCount);
-  }, 300);
-  blockedHistogram.disable();
+    // 吞吐:固定窗口内连续生成,统计每秒页数。
+    let pages = 0;
+    const throughputStart = performance.now();
+    while (performance.now() - throughputStart < throughputWindowMs) {
+      await generatePage(rowCount);
+      pages += 1;
+    }
+    const throughputPagesPerSec =
+      (pages / (performance.now() - throughputStart)) * 1000;
+
+    zero = {
+      durationsMs,
+      medianMs: median(durationsMs),
+      lag,
+      lagAmplification: lag.maxLagMs / Math.max(baselineLag.maxLagMs, 0.01),
+      digests,
+      renderMetricCallsPerRun: callsPerRun,
+      computeMode: getLastComputeMode(),
+      throughputPagesPerSec,
+    };
+  }
+
+  const allDigests = [
+    ...(legacy?.digests ?? []),
+    ...(zero?.digests ?? []),
+  ];
+  const identicalAcrossRuns =
+    (legacy === null ||
+      legacy.digests.every((digest) => digest === legacy.digests[0])) &&
+    (zero === null ||
+      zero.digests.every((digest) => digest === zero.digests[0]));
+
+  const crossPathIdentical =
+    legacy === null || zero === null
+      ? true
+      : legacyHtml === zeroHtml &&
+        (legacy.digests[0] ?? "") === (zero.digests[0] ?? "");
+
+  const expectedDigest = rowCount === 64 ? EXPECTED_SHA256_ROW64 : null;
+  const digestMatchesExpected =
+    expectedDigest === null
+      ? true
+      : allDigests.length > 0 &&
+        allDigests.every((digest) => digest === expectedDigest);
+
+  const callsPerRun =
+    zero?.renderMetricCallsPerRun ?? legacy?.renderMetricCallsPerRun ?? 0;
 
   return {
     rowCount,
     columnCount: config.columns,
     cellCount: rowCount * config.columns,
-    renderMetricCallsPerRun,
-    renderMetricCallsEachRun: callsEachRun,
-    meets300Calls: renderMetricCallsPerRun >= 300,
-    totalDurationsMs,
-    totalMedianMs: median(totalDurationsMs),
-    blockedLag: {
-      maxLagMs: Math.max(
-        blockedLag.maxLagMs,
-        blockedHistogram.max / 1e6,
-      ),
-      meanLagMs:
-        blockedLag.meanLagMs > 0
-          ? blockedLag.meanLagMs
-          : blockedHistogram.mean / 1e6,
-      delayedTicks: blockedLag.delayedTicks,
-    },
-    baselineLag: {
-      maxLagMs: Math.max(baselineLag.maxLagMs, baselineHistogram.max / 1e6),
-      meanLagMs:
-        baselineLag.meanLagMs > 0
-          ? baselineLag.meanLagMs
-          : baselineHistogram.mean / 1e6,
-      delayedTicks: baselineLag.delayedTicks,
-    },
+    baselineLag,
+    legacy,
+    zero,
     identicalAcrossRuns,
-    digests,
-    syncConfigReadMs,
-    htmlLength: outputs[0]?.length ?? 0,
+    crossPathIdentical,
+    expectedDigest,
+    digestMatchesExpected,
+    htmlLength: (zeroHtml || legacyHtml).length,
+    meets300Calls: callsPerRun >= 300,
+    zeroPathMaxLagOk:
+      zero === null || zero.lag.maxLagMs <= ZERO_PATH_MAX_LAG_BUDGET_MS,
   };
 }
