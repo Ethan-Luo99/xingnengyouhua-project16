@@ -13,6 +13,14 @@
  *
  * 两条路径共用同一个 assembleHtml 模板函数与同一个 computeMetric 纯函数,
  * 输出逐字节等价,与分片/调度顺序无关。
+ *
+ * 运行时能力(B 轮新增):
+ *  - SIGUSR2 触发异步重读 config.json 并热更新 cellHashRounds 与线程池
+ *    目标大小;进行中的生成用旧参数跑完,新任务用新参数,重读失败保持
+ *    旧配置并打印告警,进程不退出(reloadConfig / installConfigHotReload);
+ *  - generatePage 接受可选 AbortSignal:取消时停止派发新分片、通知
+ *    worker 丢弃在途分片、已算出的部分结果全部丢弃,以 AbortError 拒绝,
+ *    不产出半截 HTML,线程池状态不受污染。
  */
 import { readFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
@@ -22,7 +30,13 @@ import { setImmediate as yieldToEventLoop } from "node:timers/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { computeMetric } from "./metric-core.js";
-import { MetricWorkerPool } from "./worker-pool.js";
+import {
+  MetricWorkerPool,
+  createAbortError,
+  isAbortError,
+} from "./worker-pool.js";
+
+export { isAbortError };
 
 const CONFIG_PATH = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
@@ -37,11 +51,20 @@ const HASH_ROUNDS_FALLBACK = 2000;
 export const EXPECTED_SHA256_ROW64 =
   "a6aeae862721779f9d4d043de1a3a37aae0b60057a7541e75d7d18fa27ceb7dc";
 
+/** 韧性验证用热更新配置(与 main.ts 中 HOT_CONFIG_JSON 逐字节一致)。 */
+export const HOT_RELOAD_ROUNDS = 90000;
+
+/** 热更新为 cellHashRounds=90000 后 rowCount=64 的实测基准摘要。 */
+export const EXPECTED_SHA256_ROW64_HOT =
+  "5591d6cb7ad24ac8611dfc2dc7a8f66da77d28cb3000a86bb500b81a23cfa4af";
+
 interface ReportConfig {
   title: string;
   generator: string;
   columns: number;
   cellHashRounds: number;
+  /** 可选:线程池目标大小,热更新时下发给 MetricWorkerPool。 */
+  workerThreads?: number;
 }
 
 /** renderMetric / 分片计算被调用的真实次数,用于校验 ">=300 次函数执行"。 */
@@ -77,13 +100,23 @@ function parseConfig(parsed: unknown): ReportConfig {
     Number.isInteger(record.cellHashRounds)
       ? record.cellHashRounds
       : HASH_ROUNDS_FALLBACK;
+  const workerThreads =
+    typeof record.workerThreads === "number" &&
+    Number.isInteger(record.workerThreads) &&
+    record.workerThreads > 0
+      ? record.workerThreads
+      : undefined;
 
-  return {
+  const parsedConfig: ReportConfig = {
     title: String(record.title),
     generator: String(record.generator),
     columns,
     cellHashRounds,
   };
+  if (workerThreads !== undefined) {
+    parsedConfig.workerThreads = workerThreads;
+  }
+  return parsedConfig;
 }
 
 /** 同步读取并解析 ./config.json —— legacy 阻塞路径专用,原样保留。 */
@@ -115,6 +148,65 @@ export function initConfig(): Promise<LoadedConfig> {
     return loaded;
   });
   return configLoadPromise;
+}
+
+const reloadWaiters: Array<(ok: boolean) => void> = [];
+
+/** 等待下一次热重读完成(SIGUSR2 或主动调用 reloadConfig 均算)。 */
+export function waitNextConfigReload(): Promise<boolean> {
+  return new Promise<boolean>((resolve) => {
+    reloadWaiters.push(resolve);
+  });
+}
+
+function notifyReload(ok: boolean): void {
+  const waiters = reloadWaiters.splice(0);
+  for (const resolve of waiters) {
+    resolve(ok);
+  }
+}
+
+/**
+ * 异步重读 config.json 并热更新。
+ *  - 成功:整体换入新的 LoadedConfig 快照(进行中的生成已捕获旧快照,
+ *    会用旧参数完整跑完;新任务用新参数,同一页面内不会新旧混拼),
+ *    并把 workerThreads(若配置中存在)下发给线程池作为目标大小;
+ *  - 失败:保持旧配置,打印告警,返回 false,进程不退出。
+ */
+export async function reloadConfig(): Promise<boolean> {
+  let loaded: LoadedConfig;
+  try {
+    const rawConfig = await readFile(CONFIG_PATH, "utf8");
+    loaded = { rawConfig, config: parseConfig(JSON.parse(rawConfig)) };
+  } catch (error) {
+    console.warn(
+      "⚠ config.json 热重读失败,保持旧配置:",
+      error instanceof Error ? error.message : String(error),
+    );
+    notifyReload(false);
+    return false;
+  }
+
+  configCache = loaded;
+  configLoadPromise = Promise.resolve(loaded);
+
+  const target = loaded.config.workerThreads;
+  if (target !== undefined && pool !== null && pool.isUsable) {
+    pool.setTargetSize(target);
+  }
+  console.log(
+    `♻ config.json 热更新成功: cellHashRounds=${loaded.config.cellHashRounds}` +
+      (target !== undefined ? ` workerThreads=${target}` : ""),
+  );
+  notifyReload(true);
+  return true;
+}
+
+/** 安装 SIGUSR2 处理器:收到信号即异步重读 config.json。 */
+export function installConfigHotReload(): void {
+  process.on("SIGUSR2", () => {
+    void reloadConfig();
+  });
 }
 
 function getCachedConfig(): LoadedConfig {
@@ -238,11 +330,15 @@ const CHUNK_TIME_BUDGET_MS = 4;
 async function computeMetricsChunked(
   indices: number[],
   rounds: number,
+  signal?: AbortSignal,
 ): Promise<string[]> {
   const results: string[] = new Array<string>(indices.length);
   let sliceStart = performance.now();
 
   for (let position = 0; position < indices.length; position += 1) {
+    if (signal?.aborted) {
+      throw createAbortError();
+    }
     const index = indices[position] as number;
     results[position] = computeMetric(index, rounds);
     renderMetricInvocations += 1;
@@ -288,6 +384,22 @@ function getPool(): MetricWorkerPool | null {
   return pool;
 }
 
+/** 线程池当前状态快照,供韧性验证断言池可恢复。 */
+export function getPoolStats(): {
+  workers: number;
+  queued: number;
+  usable: boolean;
+} | null {
+  if (pool === null) {
+    return null;
+  }
+  return {
+    workers: pool.workerCount,
+    queued: pool.queuedCount,
+    usable: pool.isUsable,
+  };
+}
+
 /** 优雅关闭线程池:等待全部 worker 退出,进程可正常结束。 */
 export async function shutdownReportResources(): Promise<void> {
   const current = pool;
@@ -303,10 +415,19 @@ export async function shutdownReportResources(): Promise<void> {
  *  - 单元格计算默认在 worker 线程池执行;池故障时打印告警并
  *    降级为 setImmediate 分片计算,输出不变、进程不因此失败。
  */
-export async function generatePage(rowCount: number): Promise<string> {
+export async function generatePage(
+  rowCount: number,
+  signal?: AbortSignal,
+): Promise<string> {
   assertValidRowCount(rowCount);
+  if (signal?.aborted) {
+    throw createAbortError();
+  }
 
   const { rawConfig, config } = await initConfig();
+  if (signal?.aborted) {
+    throw createAbortError();
+  }
   const columns = config.columns;
 
   const indices: number[] = [];
@@ -318,24 +439,44 @@ export async function generatePage(rowCount: number): Promise<string> {
   const activePool = getPool();
   if (activePool !== null) {
     try {
-      metrics = await activePool.compute(indices, config.cellHashRounds);
+      metrics = await activePool.compute(
+        indices,
+        config.cellHashRounds,
+        signal,
+      );
       renderMetricInvocations += indices.length;
       lastComputeMode = "worker-pool";
     } catch (error) {
+      if (isAbortError(error)) {
+        // 取消不是池故障:不降级、不污染池状态,直接向外抛 AbortError。
+        throw error;
+      }
       poolDisabled = true;
       console.warn(
         "⚠ worker 线程池故障,降级为 setImmediate 分片计算:",
         error instanceof Error ? error.message : String(error),
       );
       await shutdownReportResources();
-      metrics = await computeMetricsChunked(indices, config.cellHashRounds);
+      metrics = await computeMetricsChunked(
+        indices,
+        config.cellHashRounds,
+        signal,
+      );
       lastComputeMode = "chunked-fallback";
     }
   } else {
-    metrics = await computeMetricsChunked(indices, config.cellHashRounds);
+    metrics = await computeMetricsChunked(
+      indices,
+      config.cellHashRounds,
+      signal,
+    );
     lastComputeMode = "chunked-fallback";
   }
 
+  if (signal?.aborted) {
+    // 已取消:已算出的部分结果全部丢弃,不产出半截 HTML。
+    throw createAbortError();
+  }
   return assembleHtml(rawConfig, config, rowCount, metrics);
 }
 
