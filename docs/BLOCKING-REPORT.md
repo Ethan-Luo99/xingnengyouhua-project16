@@ -72,7 +72,7 @@ a6aeae862721779f9d4d043de1a3a37aae0b60057a7541e75d7d18fa27ceb7dc
 | 阻塞点 | 修复 |
 | --- | --- |
 | 同步 I/O `readFileSync(config.json)` | `initConfig()`(`src/report.ts:108`)启动期一次性 `fs.promises.readFile` 并缓存原始文本与解析结果;请求路径只读内存缓存,**零同步 I/O**。 |
-| CPU 密集计算独占主线程 | 默认交给 `MetricWorkerPool`(`src/worker-pool.ts`)固定大小 worker_threads 线程池执行;池不可用或 worker 崩溃时打印告警并**降级为 `setImmediate` 分片计算**(`computeMetricsChunked`,`src/report.ts:238`,每片 ≤4ms 即让出事件循环)。 |
+| CPU 密集计算独占主线程 | 默认交给 `MetricWorkerPool`(`src/worker-pool.ts`)worker_threads 线程池执行(规模按排队 P95 自适应,见第 5 节);池不可用或 worker 崩溃时打印告警并**降级为 `setImmediate` 分片计算**(`computeMetricsChunked`,每片 ≤4ms 即让出事件循环)。 |
 
 输出等价性的结构保证:
 
@@ -109,23 +109,85 @@ a6aeae862721779f9d4d043de1a3a37aae0b60057a7541e75d7d18fa27ceb7dc
 
 worker 崩溃链路实测(`REPORT_CRASH_WORKER=1`):打印告警 `⚠ worker 线程池故障,降级为 setImmediate 分片计算: metric-worker 异常退出,退出码 1`,随后以分片模式完成全部测量,最大卡顿 4.46 ms,**进程退出码 0**。
 
-## 5. 文件说明
+## 5. 运行时可调与韧性
 
-- `src/report.ts` — 双路径实现与基准:`generatePageLegacy`/`renderMetric`/`loadConfigSync`(legacy 反例)、`initConfig`/`generatePage`/`computeMetricsChunked`(零阻塞)、`assembleHtml`(共用模板)、`benchmark`(双路径对照测量)、`shutdownReportResources`(优雅关闭)。
+在双路径基准之上,零阻塞路径进一步具备**热更新 + 自适应调度 + 可取消**三项运行期能力。
+`npx tsx src/main.ts` 在原有对照结论之后追加"韧性验证"段,任一子项失败进程退出码非 0。
+
+### 5.1 动态参数热更新(SIGUSR2)
+
+- `installConfigHotReload()`(`src/main.ts` 启动时注册)把 `SIGUSR2` 绑定到 `reloadConfig()`(`src/report.ts`):信号到达后**异步** `fs.promises.readFile` 重读 `config.json`,热更新 `cellHashRounds` 与线程池目标大小(可选字段 `workerPoolSize`)。
+- **页面级快照,杜绝新旧混拼**:`generatePage` 在入口处通过 `getCurrentConfig()` 抓取当前配置引用,整页(含全部分片)都用这一份参数;热更新只替换缓存指针,进行中的页面不受影响,重读完成后开始的新页面才用新参数。已用专项脚本验证:一个 220 行页面在途时把 `cellHashRounds` 由 180000 改为 190000,旧页摘要 `7febeaa4…b7a9a`、新页摘要 `3013a008…a24e2`,二者不同,说明同页没有混拼。
+- **失败安全**:写入非法 JSON 后触发重读,实测打印 `⚠ config.json 重读失败,保留旧配置: Expected property name or '}' in JSON at position 2 (line 1 column 3)`,内存仍保留 190000,进程不退出。
+- **信号路径真实生效**:还原基准配置后 `process.kill(pid, "SIGUSR2")`,轮询确认 rounds 回到 180000,随后 `rowCount=64` 摘要仍为基准值。
+
+### 5.2 自适应线程池
+
+`MetricWorkerPool`(`src/worker-pool.ts`)不再固定大小,worker 数量在 **[2, os.availableParallelism()-1]**(本机 12 核 → [2, 11])内自适应:
+
+- 每个采样窗口统计任务**排队等待时长**(仍在排队的任务按截至窗口的已等待时长计入,避免首个积压窗口漏判);**连续 N 个窗口 P95 超阈值**且池饱和才扩容,空闲超过 `idleTimeoutMs` 才缩容;默认参数为窗口 250ms、N=4、P95 阈值 25ms、空闲 1500ms。
+- 每次决策打印一行日志,含**当时队列长度与依据**;缩容只回收空闲 worker(`terminate` 标记为主动退出,不算故障),**排队/在途任务一律保留,不丢弃**。
+- 韧性验证切换到激进参数(窗口 50ms、N=1、阈值 1ms、空闲 150ms),并发 12 个 160 行大页制造排队,实测真实日志:
+
+```
+[pool] 扩容决策: workers 8 → 9 (队列长度=176, 连续 1 个窗口 排队 P95=50.60ms > 阈值 1ms)
+[pool] 扩容决策: workers 9 → 10 (队列长度=159, 连续 1 个窗口 排队 P95=99.93ms > 阈值 1ms)
+[pool] 扩容决策: workers 10 → 11 (队列长度=144, 连续 1 个窗口 排队 P95=150.79ms > 阈值 1ms)
+[pool] 缩容决策: workers 11 → 10 (队列长度=0, 空闲超时 150ms, 目标大小=3)
+...（连续逐台回收）...
+[pool] 缩容决策: workers 4 → 3 (队列长度=0, 空闲超时 150ms, 目标大小=3)
+```
+
+当段共 **3 次扩容(峰值 11 台 worker)、8 次缩容(回到目标 3 台)**;突发期间 12 个页面输出摘要两两一致。
+
+### 5.3 可取消生成(AbortSignal)
+
+`generatePage(rowCount, signal?)`(`src/report.ts`)新增可选 `AbortSignal`;线程池 `compute(indices, rounds, signal?)` 实现任务级取消:
+
+- 取消后**停止派发新分片**(派发循环检查 `signal.aborted`),**尚未派发**的排队分片直接从队列移除并以 `AbortError` 拒绝;
+- **在途分片**通过 1 字节 `SharedArrayBuffer` 标志(并辅以 `cancel` 消息)通知 worker;worker 每 32 个单元格在检查点读取标志,命中即停止、回 `discarded`,**已算出的部分结果不回传、直接丢弃**;
+- 所有分片结果被丢弃,`assembleHtml` 不会被调用,**不产出半截 HTML**;取消不把池标记为故障(`AbortError` 在降级 `catch` 中被识别并直接上抛),worker 回执后全部回归空闲。
+- 实测:384 行页面派发 8ms 后 `controller.abort()`,调用以 **AbortError 拒绝**,池排空到 `queued=0/inFlight=0`;紧接着一次正常 `rowCount=64` 生成成功,SHA-256 仍为 `a6aeae86…27ceb7dc`。
+
+### 5.4 韧性验证实测结论(真实运行输出)
+
+以下数据来自 `npx tsx src/main.ts` 实际运行(非手填),退出码 0:
+
+| 验证项 | 结果 |
+| --- | --- |
+| (a) 中途取消以 AbortError 拒绝 | 通过 |
+| (a) 取消后池状态可恢复(queued/inFlight 归零) | 通过 |
+| (a) 取消后重跑 rowCount=64 SHA-256 | `a6aeae86…27ceb7dc`(与基准一致) |
+| (b) 旧参数(180000)rowCount=64 SHA-256 | `a6aeae862721779f9d4d043de1a3a37aae0b60057a7541e75d7d18fa27ceb7dc` |
+| (b) 新参数(190000)两轮稳定且不同于旧 | 通过 |
+| (b) 新参数(190000)实测 SHA-256 | `6648ed309965b80c801e0251d86876267977367c120d2fb6677c0d507fcb2558` |
+| (b) 重读非法 JSON 保留旧配置、进程不退出 | 通过 |
+| (b) SIGUSR2 还原后 SHA-256 | `a6aeae86…27ceb7dc`(与基准一致) |
+| (c) 扩容决策次数(峰值 worker) | 3 次(峰值 11) |
+| (c) 缩容决策次数(最终 worker) | 8 次(回到 3) |
+
+无论热更新、扩缩容、取消如何交织,成功生成的 `rowCount=64` 页面 SHA-256 始终为
+`a6aeae862721779f9d4d043de1a3a37aae0b60057a7541e75d7d18fa27ceb7dc`,
+输出可复现性与对照基准结论保持不变。
+
+## 6. 文件说明
+
+- `src/report.ts` — 双路径实现与基准:`generatePageLegacy`/`renderMetric`/`loadConfigSync`(legacy 反例)、`initConfig`/`reloadConfig`/`installConfigHotReload`/`getCurrentConfig`(启动缓存 + SIGUSR2 热更新)、`generatePage(rowCount, signal?)`(零阻塞 + 可取消)、`computeMetricsChunked`、`assembleHtml`(共用模板)、`benchmark`、线程池自适应/统计辅助与优雅关闭。
 - `src/metric-core.ts` — `computeMetric`/`mixHash32`/`isPrime` 纯计算核心,主线程与 worker 共用。
-- `src/metric-worker.ts` — worker_threads 工作线程脚本;`REPORT_CRASH_WORKER=1` 可模拟崩溃。
-- `src/worker-pool.ts` — `MetricWorkerPool` 固定大小线程池:任务切片分发、故障标记、优雅关闭。
-- `src/main.ts` — 调 `benchmark({ rowCount: 64, runs: 3 })` 并打印规模、双路径耗时/卡顿/吞吐对照表、可复现性校验与总体结论。
-- `config.json` — 本地配置;`columns` 决定列数,`cellHashRounds` 调节每单元格计算量。零阻塞路径在启动期异步读取一次并缓存。
+- `src/metric-worker.ts` — worker_threads 工作线程脚本:支持 `compute`/`cancel` 消息与共享取消标志,周期性检查点丢弃在途分片;`REPORT_CRASH_WORKER=1` 可模拟崩溃。
+- `src/worker-pool.ts` — `MetricWorkerPool` 自适应线程池:[2, availableParallelism()-1] 区间内按排队 P95 连续超阈值扩容、空闲超时缩容,打印决策日志;任务级取消、目标大小热更新(`setTargetSize`)、故障标记与优雅关闭。
+- `src/main.ts` — 调 `benchmark({ rowCount: 64, runs: 3 })` 打印双路径对照,随后执行韧性验证(a 取消 / b 热更新 / c 扩缩容)并在任一项失败时置非 0 退出码。
+- `config.json` — 本地配置;`columns` 决定列数,`cellHashRounds` 调节每单元格计算量,可选 `workerPoolSize` 指定线程池目标大小。启动期异步读取并缓存,运行期经 SIGUSR2 热更新。
 - `tsconfig.json` — `strict` + `noImplicitAny`,`tsc --noEmit` 通过,源码无 `any`。
 
-## 6. 复现与调节
+## 7. 复现与调节
 
 ```bash
 npx tsc --noEmit      # 严格类型检查
-npx tsx src/main.ts   # 双路径对照基准 + 全部验证结论
+npx tsx src/main.ts   # 双路径对照基准 + 韧性验证(取消/热更新/扩缩容)
 ```
 
 - 想让卡顿更明显/更轻:改 `config.json` 的 `cellHashRounds`(与卡顿近似线性),或改 `src/main.ts` 中 `rowCount`。
 - 只测单条路径:`benchmark({ path: "legacy" })` 或 `benchmark({ path: "zero" })`。
 - 验证降级链路:`REPORT_FORCE_FALLBACK=1 node --import tsx src/main.ts`(强制分片)、`REPORT_CRASH_WORKER=1 node --import tsx src/main.ts`(模拟 worker 崩溃)。
+- 手动触发热更新:运行中向进程发送 `kill -USR2 <pid>`,进程异步重读 `config.json`;重读失败只告警、不退出。

@@ -22,9 +22,15 @@ import { setImmediate as yieldToEventLoop } from "node:timers/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { computeMetric } from "./metric-core.js";
-import { MetricWorkerPool } from "./worker-pool.js";
+import {
+  AGGRESSIVE_AUTO_SCALE_OPTIONS,
+  type AutoScaleOptions,
+  createAbortError,
+  MetricWorkerPool,
+  type PoolStats,
+} from "./worker-pool.js";
 
-const CONFIG_PATH = path.resolve(
+export const CONFIG_PATH = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
   "..",
   "config.json",
@@ -42,6 +48,8 @@ interface ReportConfig {
   generator: string;
   columns: number;
   cellHashRounds: number;
+  /** 可选:线程池目标大小;缺省由线程池自行决定(夹取到合法区间)。 */
+  workerPoolSize?: number;
 }
 
 /** renderMetric / 分片计算被调用的真实次数,用于校验 ">=300 次函数执行"。 */
@@ -78,11 +86,20 @@ function parseConfig(parsed: unknown): ReportConfig {
       ? record.cellHashRounds
       : HASH_ROUNDS_FALLBACK;
 
+  const workerPoolSize =
+    "workerPoolSize" in record &&
+    typeof record.workerPoolSize === "number" &&
+    Number.isInteger(record.workerPoolSize) &&
+    record.workerPoolSize > 0
+      ? record.workerPoolSize
+      : undefined;
+
   return {
     title: String(record.title),
     generator: String(record.generator),
     columns,
     cellHashRounds,
+    workerPoolSize,
   };
 }
 
@@ -115,6 +132,81 @@ export function initConfig(): Promise<LoadedConfig> {
     return loaded;
   });
   return configLoadPromise;
+}
+
+let reloadInFlight: Promise<LoadedConfig> | null = null;
+
+/** 当前缓存配置(未初始化时抛错),供验证读取热更新后的参数。 */
+export function getCurrentConfig(): LoadedConfig {
+  return getCachedConfig();
+}
+
+/**
+ * 异步重读 config.json 并热更新 cellHashRounds 与线程池目标大小。
+ *
+ * 快照语义:进行中的 generatePage 在其入口处持有旧 LoadedConfig 引用,
+ * 整页(含所有分片)都用旧参数跑完;只有重读完成后开始的新页面才看到
+ * 新参数,因此同一页面内绝不会出现新旧参数混拼。
+ *
+ * 读取或解析失败时保留旧配置、打印告警并拒绝,进程不退出。
+ * 并发触发复用同一个 Promise,避免并发重读造成状态抖动。
+ */
+export function reloadConfig(): Promise<LoadedConfig> {
+  if (reloadInFlight !== null) {
+    return reloadInFlight;
+  }
+  reloadInFlight = readFile(CONFIG_PATH, "utf8")
+    .then((rawConfig) => {
+      let loaded: LoadedConfig;
+      try {
+        loaded = { rawConfig, config: parseConfig(JSON.parse(rawConfig)) };
+      } catch (error) {
+        throw error instanceof Error
+          ? error
+          : new Error(String(error));
+      }
+      const previous = configCache;
+      configCache = loaded;
+      if (loaded.config.workerPoolSize !== undefined) {
+        desiredPoolSize = loaded.config.workerPoolSize;
+        pool?.setTargetSize(loaded.config.workerPoolSize);
+      }
+      console.log(
+        `[config] 热更新生效: cellHashRounds ` +
+          `${previous?.config.cellHashRounds ?? "?"} → ${loaded.config.cellHashRounds}` +
+          (loaded.config.workerPoolSize !== undefined
+            ? `, workerPoolSize 目标=${loaded.config.workerPoolSize}`
+            : ""),
+      );
+      return loaded;
+    })
+    .catch((error: unknown) => {
+      console.warn(
+        "⚠ config.json 重读失败,保留旧配置:",
+        error instanceof Error ? error.message : String(error),
+      );
+      throw error instanceof Error ? error : new Error(String(error));
+    })
+    .finally(() => {
+      reloadInFlight = null;
+    });
+  return reloadInFlight;
+}
+
+let sigusr2Installed = false;
+
+/**
+ * 注册 SIGUSR2 → reloadConfig()(幂等,只注册一次)。
+ * 重读失败只告警、不抛出(信号回调中的 reject 无人接收),进程不退出。
+ */
+export function installConfigHotReload(): void {
+  if (sigusr2Installed) {
+    return;
+  }
+  sigusr2Installed = true;
+  process.on("SIGUSR2", () => {
+    reloadConfig().catch(() => undefined);
+  });
 }
 
 function getCachedConfig(): LoadedConfig {
@@ -238,11 +330,15 @@ const CHUNK_TIME_BUDGET_MS = 4;
 async function computeMetricsChunked(
   indices: number[],
   rounds: number,
+  signal?: AbortSignal,
 ): Promise<string[]> {
   const results: string[] = new Array<string>(indices.length);
   let sliceStart = performance.now();
 
   for (let position = 0; position < indices.length; position += 1) {
+    if (signal?.aborted === true) {
+      throw createAbortError();
+    }
     const index = indices[position] as number;
     results[position] = computeMetric(index, rounds);
     renderMetricInvocations += 1;
@@ -263,6 +359,9 @@ let poolDisabled = process.env.REPORT_FORCE_FALLBACK === "1";
 let lastComputeMode: ComputeMode = poolDisabled
   ? "chunked-fallback"
   : "worker-pool";
+/** 建池时采用的目标大小(可被热更新改写);undefined 用池默认值。 */
+let desiredPoolSize: number | undefined;
+let desiredAutoScale: AutoScaleOptions | undefined;
 
 /** 最近一次零阻塞 generatePage 实际使用的计算模式。 */
 export function getLastComputeMode(): ComputeMode {
@@ -275,7 +374,7 @@ function getPool(): MetricWorkerPool | null {
   }
   if (pool === null) {
     try {
-      pool = new MetricWorkerPool();
+      pool = new MetricWorkerPool(desiredPoolSize, desiredAutoScale);
     } catch (error) {
       poolDisabled = true;
       console.warn(
@@ -286,6 +385,27 @@ function getPool(): MetricWorkerPool | null {
     }
   }
   return pool;
+}
+
+/** 返回当前线程池快照(池未建立时为 null),供韧性验证检查状态。 */
+export function getPoolStats(): PoolStats | null {
+  return pool === null ? null : pool.getStats();
+}
+
+/** 运行期调整自适应参数(若池尚未建立则记录,建池时生效)。 */
+export function configurePoolAutoScaling(options: AutoScaleOptions): void {
+  desiredAutoScale = options;
+  pool?.configureAutoScaling(options);
+}
+
+/** 韧性验证使用的激进取值(短窗口、低阈值),快速触发扩缩容。 */
+export function enableAggressiveAutoScaling(): void {
+  configurePoolAutoScaling(AGGRESSIVE_AUTO_SCALE_OPTIONS);
+}
+
+/** 清零线程池扩缩容决策计数,供韧性验证分段统计。 */
+export function resetPoolScaleEventCounts(): void {
+  pool?.resetScaleEventCounts();
 }
 
 /** 优雅关闭线程池:等待全部 worker 退出,进程可正常结束。 */
@@ -301,12 +421,24 @@ export async function shutdownReportResources(): Promise<void> {
  * 零阻塞路径:异步生成与 legacy 逐字节等价的 HTML 报告。
  *  - config 来自启动期缓存,零同步 I/O;
  *  - 单元格计算默认在 worker 线程池执行;池故障时打印告警并
- *    降级为 setImmediate 分片计算,输出不变、进程不因此失败。
+ *    降级为 setImmediate 分片计算,输出不变、进程不因此失败;
+ *  - signal 中止后以 AbortError 拒绝:不派发新分片、在途分片被丢弃,
+ *    assembleHtml 不会被调用,因此不产出任何半截 HTML,池状态不受污染。
  */
-export async function generatePage(rowCount: number): Promise<string> {
+export async function generatePage(
+  rowCount: number,
+  signal?: AbortSignal,
+): Promise<string> {
   assertValidRowCount(rowCount);
+  if (signal?.aborted === true) {
+    throw createAbortError();
+  }
 
-  const { rawConfig, config } = await initConfig();
+  // 快照:本次生成整页(含全部分片)都用这一份配置,
+  // 即使期间发生热更新也不影响本页,杜绝同页新旧参数混拼。
+  await initConfig();
+  // 取"当前"缓存而非 initConfig 返回的初次承诺,否则热更新不生效。
+  const { rawConfig, config } = getCurrentConfig();
   const columns = config.columns;
 
   const indices: number[] = [];
@@ -318,24 +450,43 @@ export async function generatePage(rowCount: number): Promise<string> {
   const activePool = getPool();
   if (activePool !== null) {
     try {
-      metrics = await activePool.compute(indices, config.cellHashRounds);
+      metrics = await activePool.compute(
+        indices,
+        config.cellHashRounds,
+        signal,
+      );
       renderMetricInvocations += indices.length;
       lastComputeMode = "worker-pool";
     } catch (error) {
+      if (error instanceof Error && error.name === "AbortError") {
+        // 取消不是池故障:不降级、不标记池不可用,直接向上拒绝。
+        throw error;
+      }
       poolDisabled = true;
       console.warn(
         "⚠ worker 线程池故障,降级为 setImmediate 分片计算:",
         error instanceof Error ? error.message : String(error),
       );
       await shutdownReportResources();
-      metrics = await computeMetricsChunked(indices, config.cellHashRounds);
+      metrics = await computeMetricsChunked(
+        indices,
+        config.cellHashRounds,
+        signal,
+      );
       lastComputeMode = "chunked-fallback";
     }
   } else {
-    metrics = await computeMetricsChunked(indices, config.cellHashRounds);
+    metrics = await computeMetricsChunked(
+      indices,
+      config.cellHashRounds,
+      signal,
+    );
     lastComputeMode = "chunked-fallback";
   }
 
+  if (signal !== undefined && signal.aborted) {
+    throw createAbortError();
+  }
   return assembleHtml(rawConfig, config, rowCount, metrics);
 }
 
